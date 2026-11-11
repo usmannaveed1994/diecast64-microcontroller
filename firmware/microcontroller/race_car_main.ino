@@ -225,19 +225,12 @@ void bootAnimation() {
 
 const uint8_t TEXT_BAND_HEIGHT = 24;
 const uint8_t TEXT_FONT_HEIGHT = 16;       // TFT_eSPI font 2
-const uint8_t TEXT_PADDING = 4;
 const size_t FLOATING_TEXT_MAX_LENGTH = 64;
 const float TEXT_SCROLL_SPEED = 34.0f;     // pixels per second
-const float TEXT_BOB_AMPLITUDE = 2.0f;     // pixels
-const float TEXT_BOB_SPEED = 0.0032f;      // radians per millisecond
 
 String floatingText;
 int floatingTextWidth = 0;
 float floatingTextScroll = 0.0f;
-
-bool floatingTextNeedsScroll() {
-  return floatingTextWidth > TFT_SPRITE_WIDTH - TEXT_PADDING * 2;
-}
 
 void setFloatingText(const String& text) {
   floatingText = text.substring(0, FLOATING_TEXT_MAX_LENGTH);
@@ -249,11 +242,12 @@ void setFloatingText(const String& text) {
 }
 
 void updateFloatingText(float dt) {
-  if (!floatingTextNeedsScroll()) {
+  if (floatingText.length() == 0) {
     floatingTextScroll = 0.0f;
     return;
   }
 
+  // Always marquee horizontally, regardless of whether the text fits.
   floatingTextScroll += TEXT_SCROLL_SPEED * dt;
 
   if (floatingTextScroll > floatingTextWidth + TFT_SPRITE_WIDTH) {
@@ -262,10 +256,7 @@ void updateFloatingText(float dt) {
 }
 
 int floatingTextX() {
-  if (!floatingTextNeedsScroll()) {
-    return (TFT_SPRITE_WIDTH - floatingTextWidth) / 2;
-  }
-
+  // Text enters from the right edge and exits past the left edge.
   return TFT_SPRITE_WIDTH - (int)floatingTextScroll;
 }
 
@@ -283,8 +274,8 @@ void drawFloatingText() {
   sprite.setTextSize(1);
   sprite.setTextColor(TFT_CYAN);
 
-  const float bob = TEXT_BOB_AMPLITUDE * sinf(millis() * TEXT_BOB_SPEED);
-  const int y = bandTop + (TEXT_BAND_HEIGHT - TEXT_FONT_HEIGHT) / 2 + (int)lroundf(bob);
+  // Horizontally scrolling only: the vertical position is fixed.
+  const int y = bandTop + (TEXT_BAND_HEIGHT - TEXT_FONT_HEIGHT) / 2;
 
   sprite.drawString(floatingText, floatingTextX(), y);
 }
