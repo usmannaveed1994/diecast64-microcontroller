@@ -7,6 +7,8 @@
 #include <Wire.h>
 #include <MPU6050_light.h>
 #include <math.h>
+#include <LittleFS.h>
+#include <driver/i2s.h>
 
 #include "camaro.h"
 
@@ -35,6 +37,23 @@ MPU6050 mpu(Wire);
 // LEDs
 #define LED_A_PIN 25   // LEDs 1 and 2
 #define LED_B_PIN 26   // LEDs 3 and 4
+
+// =====================================================
+//  AUDIO - MAX98357A
+// =====================================================
+
+#define NOTIFICATION_AUDIO_BCLK 21
+#define NOTIFICATION_AUDIO_LRC  22
+#define NOTIFICATION_AUDIO_DOUT 2
+
+#define NOTIFICATION_AUDIO_SAMPLE_RATE 44100
+#define NOTIFICATION_AUDIO_FILE "/notification-click.wav"
+#define LIGHTS_AUDIO_FILE "/lights.wav"
+
+TaskHandle_t notificationAudioTaskHandle = nullptr;
+
+bool notificationAudioReady = false;
+volatile bool notificationAudioPlaying = false;
 
 // =====================================================
 // 3D ENGINE
@@ -546,6 +565,120 @@ void drawCarScreen() {
   sprite.pushSprite(0, 0);
 }
 
+void initNotificationAudio() {
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS mount failed!");
+    return;
+  }
+
+  Serial.println("LittleFS mounted!");
+
+  if (!LittleFS.exists(NOTIFICATION_AUDIO_FILE)) {
+    Serial.println("Notification WAV file not found!");
+    return;
+  }
+
+  i2s_config_t i2sConfig = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = NOTIFICATION_AUDIO_SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t pinConfig = {
+    .bck_io_num = NOTIFICATION_AUDIO_BCLK,
+    .ws_io_num = NOTIFICATION_AUDIO_LRC,
+    .data_out_num = NOTIFICATION_AUDIO_DOUT,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+
+  esp_err_t result = i2s_driver_install(I2S_NUM_0, &i2sConfig, 0, NULL);
+
+  if (result != ESP_OK) {
+    Serial.printf("I2S install failed: %d\n", result);
+    return;
+  }
+
+  i2s_set_pin(I2S_NUM_0, &pinConfig);
+  i2s_zero_dma_buffer(I2S_NUM_0);
+
+  notificationAudioReady = true;
+  Serial.println("Notification audio ready!");
+}
+
+void playNotificationAudio() {
+  if (!notificationAudioReady || notificationAudioPlaying) return;
+
+  notificationAudioPlaying = true;
+
+  File file = LittleFS.open(NOTIFICATION_AUDIO_FILE, "r");
+  if (!file) {
+    notificationAudioPlaying = false;
+    return;
+  }
+
+  // Skip standard WAV header (44 bytes)
+  file.seek(44);
+
+  uint8_t buffer[512];
+  size_t bytesWritten;
+
+  while (file.available()) {
+    int bytesRead = file.read(buffer, sizeof(buffer));
+
+    i2s_write(
+      I2S_NUM_0,
+      buffer,
+      bytesRead,
+      &bytesWritten,
+      portMAX_DELAY
+    );
+  }
+
+  file.close();
+  notificationAudioPlaying = false;
+}
+
+void playLightsAudio() {
+  if (!notificationAudioReady || notificationAudioPlaying) return;
+
+  notificationAudioPlaying = true;
+
+  File file = LittleFS.open(LIGHTS_AUDIO_FILE, "r");
+  if (!file) {
+    notificationAudioPlaying = false;
+    return;
+  }
+
+  // Skip standard WAV header (44 bytes)
+  file.seek(44);
+
+  uint8_t buffer[512];
+  size_t bytesWritten;
+
+  while (file.available()) {
+    int bytesRead = file.read(buffer, sizeof(buffer));
+
+    i2s_write(
+      I2S_NUM_0,
+      buffer,
+      bytesRead,
+      &bytesWritten,
+      portMAX_DELAY
+    );
+  }
+
+  file.close();
+  notificationAudioPlaying = false;
+}
+
 // =====================================================
 // REMOTE CONTROL (MQTT)
 // =====================================================
@@ -612,12 +745,14 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
   if (topicName == topicTextSet) {
     applyFloatingText(message);
+    playNotificationAudio();
     return;
   }
 
   if (topicName == topicLedASet) {
     ledAOn = message.equalsIgnoreCase("ON");
     digitalWrite(LED_A_PIN, ledAOn ? HIGH : LOW);
+    playLightsAudio();
     publishLedStates();
     return;
   }
@@ -625,6 +760,7 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   if (topicName == topicLedBSet) {
     ledBOn = message.equalsIgnoreCase("ON");
     digitalWrite(LED_B_PIN, ledBOn ? HIGH : LOW);
+    playLightsAudio();
     publishLedStates();
     return;
   }
@@ -988,6 +1124,7 @@ void setup() {
 
   initDisplay();
   bootAnimation();
+  initNotificationAudio();
 
   initTopics();
   initSensors();
