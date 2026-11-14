@@ -1,12 +1,13 @@
 'use client';
 
 import { useState } from 'react';
-import { Cpu, LayoutDashboard, Wifi } from 'lucide-react';
+import { AudioLines, Cpu, LayoutDashboard, Wifi } from 'lucide-react';
 import LedDashboard from './components/ledDashboard';
+import WalkieTalkie from './components/walkieTalkie';
 import WifiProvisioner from './components/wifiProvisioner';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
-type TabValue = 'dashboard' | 'provision';
+type TabValue = 'dashboard' | 'walkie' | 'provision';
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<TabValue>('dashboard');
@@ -39,6 +40,13 @@ export default function Home() {
             <LedDashboard />
           </TabsContent>
           <TabsContent
+            value="walkie"
+            forceMount
+            className="flex-1 data-[state=inactive]:hidden"
+          >
+            <WalkieTalkie />
+          </TabsContent>
+          <TabsContent
             value="provision"
             forceMount
             className="flex-1 data-[state=inactive]:hidden"
@@ -53,6 +61,13 @@ export default function Home() {
             >
               <LayoutDashboard className="size-5" />
               Dashboard
+            </TabsTrigger>
+            <TabsTrigger
+              value="walkie"
+              className="h-12 flex-1 flex-col gap-1 rounded-xl px-3 text-[11px] font-medium data-active:bg-muted data-active:text-primary"
+            >
+              <AudioLines className="size-5" />
+              Walkie
             </TabsTrigger>
             <TabsTrigger
               value="provision"

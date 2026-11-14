@@ -109,7 +109,14 @@ export default function LedDashboard() {
       clearOfflineTimer();
       isOfflineReported = false;
       setConnectionStatus('connected');
-      mqttClient.subscribe(`${DEVICE_ROOT}/#`);
+      // Only the topics this panel renders: `#` would also deliver the walkie-talkie
+      // audio (see walkieTalkie.tsx), whose binary packets get stringified ~30x a
+      // second by the message handler below for nothing.
+      mqttClient.subscribe([
+        `${LED_TOPIC_PREFIX}/a/state`,
+        `${LED_TOPIC_PREFIX}/b/state`,
+        `${TEXT_TOPIC_PREFIX}/state`,
+      ]);
     });
 
     mqttClient.on('reconnect', () => {

@@ -54,6 +54,21 @@ MPU6050 mpu(Wire);
 // is pressed, then the microphone records until the sensor is released.
 #define WALKIE_SEND_AUDIO_FILE "/walkie-send.wav"
 
+// Walkie audio over MQTT. Both directions carry raw 16 bit mono PCM at 16 kHz,
+// so nothing has to be encoded or decoded on either side: the ESP32 only moves
+// samples between I2S and the broker, and the browser can read and write the
+// very same format through the Web Audio API.
+//
+// One packet is AUDIO_CHUNK_BYTES of audio (32 ms). Keeping the frames small
+// matters twice: PubSubClient copies every payload into its own buffer, and the
+// ESP32's TCP receive window is only a couple of kilobytes wide, so a burst of
+// large packets would overflow it before loop() gets a chance to drain them.
+#define AUDIO_STREAM_SAMPLE_RATE 16000
+#define AUDIO_CHUNK_BYTES 1024                    // 512 samples, 32 ms at 16 kHz
+#define AUDIO_CHUNK_SAMPLES (AUDIO_CHUNK_BYTES / 2)
+#define AUDIO_WRITE_TIMEOUT_MS 500                // abandoned speaker write budget
+#define SPEAKER_STREAM_TIMEOUT_MS 1500            // stop a stream that went quiet
+
 TaskHandle_t notificationAudioTaskHandle = nullptr;
 
 bool notificationAudioReady = false;
@@ -78,6 +93,12 @@ volatile bool notificationAudioPlaying = false;
 #define MIC_DMA_BUF_COUNT 8
 #define MIC_DMA_BUF_LEN 128          // 8 * 128 = 64 ms of buffering
 
+// The MQTT walkie stream is raw PCM, so both ends have to agree on the format.
+static_assert(
+  MIC_SAMPLE_RATE == AUDIO_STREAM_SAMPLE_RATE,
+  "The walkie stream carries the microphone rate, keep both at 16 kHz"
+);
+
 // INMP441: L/R tied to GND means the samples arrive on the left channel. If the
 // level stays at 0 while talking, switch this to I2S_CHANNEL_FMT_ONLY_RIGHT.
 #define MIC_CHANNEL_FORMAT I2S_CHANNEL_FMT_ONLY_LEFT
@@ -96,6 +117,25 @@ bool touchWasHeld = false;         // previous touch state, for edge detection
 uint32_t walkieStartTime = 0;      // millis() when the recording started
 uint32_t walkieSampleCount = 0;    // samples captured during this press
 uint32_t lastMicPrint = 0;         // last time the level line was printed
+
+// Outgoing audio packet being filled. The first two bytes are a little endian
+// sequence number followed by the PCM samples: the browser uses the number to
+// notice a packet that never arrived instead of playing the rest of the clip
+// shifted in time.
+static uint8_t walkieChunkFrame[AUDIO_CHUNK_BYTES + 2];
+uint16_t walkieChunkIndex = 0;     // sequence number of the next packet
+size_t walkieChunkFill = 0;        // PCM bytes already inside walkieChunkFrame
+uint32_t walkieTransmissionId = 0; // id announced with the current transmission
+
+// Published from the recorder below, but defined next to the MQTT helpers that
+// need the topic definitions.
+void publishMicStart();
+void queueMicSamples(const int16_t* samples, size_t count);
+void publishMicEnd(uint32_t durationMs);
+
+// Also defined with the MQTT helpers: talking over the speaker stops whatever
+// the dashboard was streaming into it.
+void stopSpeakerStream();
 
 // =====================================================
 // 3D ENGINE
@@ -225,6 +265,11 @@ void debugPrintConfig() {
     MIC_READ_SAMPLES,
     WALKIE_SEND_AUDIO_FILE
   );
+  Serial.printf(
+    "walkie: %d Hz mono pcm, %d byte packets over MQTT (mic -> web, speaker <- web)\n",
+    AUDIO_STREAM_SAMPLE_RATE,
+    AUDIO_CHUNK_BYTES
+  );
   Serial.println("----------------------------");
 #endif
 }
@@ -237,20 +282,20 @@ void debugPrintState() {
   if (now - lastDebugPrint < DEBUG_INTERVAL_MS) return;
   lastDebugPrint = now;
 
-  Serial.printf(
-    "[dbg] t=%lu g=(%6.2f,%6.2f,%6.2f) |g|=%6.2f a=(%5.2f,%5.2f,%5.2f) "
-    "raw=(%7.2f,%7.2f) rpy=(%7.2f,%7.2f,%7.2f) %s still=%5lums "
-    "spin=%.2f spd=%6.1f off=%6.1f fps=%4.1f\n",
-    (unsigned long)now,
-    (double)gyroX, (double)gyroY, (double)gyroZ, (double)gyroMagnitude,
-    (double)accX, (double)accY, (double)accZ,
-    (double)targetRoll, (double)targetPitch,
-    (double)currentRoll, (double)currentPitch, (double)currentYaw,
-    sensorMoving ? "MOVE" : "IDLE",
-    (unsigned long)stillTimeMs(),
-    (double)spinBlend, (double)spinSpeed, (double)spinOffset,
-    (double)measuredFps
-  );
+  // Serial.printf(
+  //   "[dbg] t=%lu g=(%6.2f,%6.2f,%6.2f) |g|=%6.2f a=(%5.2f,%5.2f,%5.2f) "
+  //   "raw=(%7.2f,%7.2f) rpy=(%7.2f,%7.2f,%7.2f) %s still=%5lums "
+  //   "spin=%.2f spd=%6.1f off=%6.1f fps=%4.1f\n",
+  //   (unsigned long)now,
+  //   (double)gyroX, (double)gyroY, (double)gyroZ, (double)gyroMagnitude,
+  //   (double)accX, (double)accY, (double)accZ,
+  //   (double)targetRoll, (double)targetPitch,
+  //   (double)currentRoll, (double)currentPitch, (double)currentYaw,
+  //   sensorMoving ? "MOVE" : "IDLE",
+  //   (unsigned long)stillTimeMs(),
+  //   (double)spinBlend, (double)spinSpeed, (double)spinOffset,
+  //   (double)measuredFps
+  // );
 #endif
 }
 
@@ -629,7 +674,7 @@ void initNotificationAudio() {
   i2s_config_t i2sConfig = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = NOTIFICATION_AUDIO_SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = 0,
@@ -749,8 +794,8 @@ void playWalkieSendAudio() {
 
 void initMicrophone() {
   if (!LittleFS.exists(WALKIE_SEND_AUDIO_FILE)) {
-    Serial.printf("[mic] %s not found - the send tone will be silent\n",
-      WALKIE_SEND_AUDIO_FILE);
+    Serial.printf("[mic] %s not found - send tone will be silent\n",
+                  WALKIE_SEND_AUDIO_FILE);
   }
 
   i2s_config_t micConfig = {
@@ -767,12 +812,12 @@ void initMicrophone() {
     .fixed_mclk = 0
   };
 
-  i2s_pin_config_t micPins = {
-    .bck_io_num = MIC_BCLK,
-    .ws_io_num = MIC_WS,
-    .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = MIC_SD
-  };
+  i2s_pin_config_t micPins = {};
+  micPins.bck_io_num = MIC_BCLK;
+  micPins.ws_io_num = MIC_WS;
+  micPins.data_out_num = I2S_PIN_NO_CHANGE;
+  micPins.data_in_num = MIC_SD;
+  micPins.mck_io_num = I2S_PIN_NO_CHANGE;
 
   esp_err_t result = i2s_driver_install(I2S_NUM_1, &micConfig, 0, NULL);
 
@@ -781,15 +826,19 @@ void initMicrophone() {
     return;
   }
 
-  i2s_set_pin(I2S_NUM_1, &micPins);
-  i2s_zero_dma_buffer(I2S_NUM_1);
+  result = i2s_set_pin(I2S_NUM_1, &micPins);
 
-  // Leave the microphone clocked DOWN. Only startWalkieRecording() starts it,
-  // so the mic is electrically silent while the car is just animating.
+  if (result != ESP_OK) {
+    Serial.printf("[mic] pin setup failed: %d\n", result);
+    i2s_driver_uninstall(I2S_NUM_1);
+    return;
+  }
+
+  i2s_zero_dma_buffer(I2S_NUM_1);
   i2s_stop(I2S_NUM_1);
 
   microphoneReady = true;
-  Serial.println("[mic] ready - hold the touch sensor to talk");
+  Serial.println("[mic] ready");
 }
 
 // One readable line per MIC_PRINT_INTERVAL_MS: level in dBFS plus a small bar
@@ -847,36 +896,36 @@ void printMicLevel(
 #endif
 }
 
-// Pulls whatever the DMA buffer holds without blocking, then reports the level.
 void readMicrophone() {
   if (!microphoneReady) return;
 
+  int32_t rawSamples[MIC_READ_SAMPLES];
   int16_t samples[MIC_READ_SAMPLES];
+
   size_t bytesRead = 0;
 
   const esp_err_t result = i2s_read(
     I2S_NUM_1,
-    samples,
-    sizeof(samples),
+    rawSamples,
+    sizeof(rawSamples),
     &bytesRead,
-    0                       // 0 ticks = return immediately with what is ready
+    0
   );
 
-  // A zero-tick read normally comes back as a *partial* buffer with
-  // ESP_ERR_TIMEOUT (the driver hands over one DMA buffer at a time), so keep
-  // whatever arrived. Dropping non-OK results threw away most of the audio and
-  // made the sample count / level line update only on full-buffer reads.
   (void)result;
 
   if (bytesRead == 0) return;
 
-  const size_t count = bytesRead / sizeof(int16_t);
+  const size_t count = bytesRead / sizeof(int32_t);
 
   int32_t peak = 0;
   int64_t sum = 0;
   int64_t sumSquares = 0;
 
   for (size_t i = 0; i < count; i++) {
+    // Convert 32-bit INMP441 samples to 16-bit PCM.
+    samples[i] = (int16_t)(rawSamples[i] >> 16);
+
     const int32_t sample = samples[i];
     const int32_t magnitude = (sample < 0) ? -sample : sample;
 
@@ -888,10 +937,20 @@ void readMicrophone() {
 
   walkieSampleCount += count;
 
+  // Send converted 16-bit PCM to MQTT.
+  queueMicSamples(samples, count);
+
   const float rms = sqrtf((float)sumSquares / (float)count);
   const float dc = (float)sum / (float)count;
 
-  printMicLevel(samples, count, peak, rms, dc, millis() - walkieStartTime);
+  printMicLevel(
+    samples,
+    count,
+    peak,
+    rms,
+    dc,
+    millis() - walkieStartTime
+  );
 }
 
 void startWalkieRecording() {
@@ -899,6 +958,10 @@ void startWalkieRecording() {
     Serial.println("[walkie] microphone not ready - nothing recorded");
     return;
   }
+
+  // Half duplex: if the dashboard is currently talking through the speaker,
+  // stop that stream before the microphone starts picking it up.
+  stopSpeakerStream();
 
   // The I2S clock only runs while a transmission is in progress, so start it
   // first and then flush the DMA buffer: the microphone also hears the send
@@ -911,7 +974,14 @@ void startWalkieRecording() {
   lastMicPrint = walkieStartTime;
   walkieRecording = true;
 
-  Serial.printf("[walkie] recording @ %d Hz - release to stop\n", MIC_SAMPLE_RATE);
+  // Tells every listener on the dashboard that a new transmission is starting,
+  // then the packets below are streamed as they are captured.
+  publishMicStart();
+
+  Serial.printf(
+    "[walkie] recording @ %d Hz - streaming to MQTT, release to stop\n",
+    MIC_SAMPLE_RATE
+  );
 }
 
 void stopWalkieRecording() {
@@ -932,11 +1002,16 @@ void stopWalkieRecording() {
 
   const uint32_t durationMs = millis() - walkieStartTime;
 
+  // Flushes the last partial packet and closes the transmission for the web
+  // dashboard, which then turns the received packets into a playable clip.
+  publishMicEnd(durationMs);
+
   Serial.printf(
-    "[walkie] recording stopped: %.2f s, %lu samples @ %d Hz\n",
+    "[walkie] recording stopped: %.2f s, %lu samples @ %d Hz, %u packets sent\n",
     (double)durationMs / 1000.0,
     (unsigned long)walkieSampleCount,
-    MIC_SAMPLE_RATE
+    MIC_SAMPLE_RATE,
+    (unsigned)walkieChunkIndex
   );
 }
 
@@ -999,9 +1074,21 @@ String topicLedBState;
 String topicTextSet;
 String topicTextState;
 
+// Walkie audio. "mic" is the car's microphone (device -> dashboard) and
+// "speaker" is the MAX98357A (dashboard -> device).
+String topicMicStart;
+String topicMicChunk;
+String topicMicEnd;
+String topicSpeakerStart;
+String topicSpeakerChunk;
+String topicSpeakerEnd;
+
 void initTopics() {
   const String ledRoot = String(TOPIC_PREFIX) + "/led";
   const String textRoot = String(TOPIC_PREFIX) + "/text";
+  const String audioRoot = String(TOPIC_PREFIX) + "/audio";
+  const String micRoot = audioRoot + "/mic";
+  const String speakerRoot = audioRoot + "/speaker";
 
   topicLedASet = ledRoot + "/a/set";
   topicLedAState = ledRoot + "/a/state";
@@ -1010,6 +1097,14 @@ void initTopics() {
 
   topicTextSet = textRoot + "/set";
   topicTextState = textRoot + "/state";
+
+  topicMicStart = micRoot + "/start";
+  topicMicChunk = micRoot + "/chunk";
+  topicMicEnd = micRoot + "/end";
+
+  topicSpeakerStart = speakerRoot + "/start";
+  topicSpeakerChunk = speakerRoot + "/chunk";
+  topicSpeakerEnd = speakerRoot + "/end";
 }
 
 void publishLedStates() {
@@ -1029,7 +1124,287 @@ void applyFloatingText(const String& text) {
   Serial.println(floatingText);
 }
 
+// =====================================================
+// WALKIE AUDIO STREAM (MQTT)
+// =====================================================
+
+// ---- car microphone -> dashboard ---------------------------------------
+
+// Frames the buffered samples and hands them to the broker. The sequence number
+// in front of the PCM lets the browser spot a lost packet, and the payload is a
+// multiple of two bytes so every packet holds whole 16 bit samples.
+void flushMicChunk() {
+  if (walkieChunkFill == 0) return;
+
+  walkieChunkFrame[0] = (uint8_t)(walkieChunkIndex & 0xFF);
+  walkieChunkFrame[1] = (uint8_t)(walkieChunkIndex >> 8);
+
+  if (mqtt.connected()) {
+    mqtt.publish(
+      topicMicChunk.c_str(),
+      walkieChunkFrame,
+      (unsigned int)(walkieChunkFill + 2),
+      false
+    );
+  }
+
+  walkieChunkIndex++;
+  walkieChunkFill = 0;
+}
+
+// Appends freshly captured samples and publishes a packet every 32 ms of audio.
+// Called from readMicrophone(), i.e. on every loop pass while the touch sensor
+// is held down.
+void queueMicSamples(const int16_t* samples, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    const uint16_t sample = (uint16_t)samples[i];
+
+    // Little endian, exactly what an Int16Array in the browser expects.
+    walkieChunkFrame[2 + walkieChunkFill] = (uint8_t)(sample & 0xFF);
+    walkieChunkFrame[3 + walkieChunkFill] = (uint8_t)(sample >> 8);
+    walkieChunkFill += 2;
+
+    if (walkieChunkFill >= AUDIO_CHUNK_BYTES) {
+      flushMicChunk();
+    }
+  }
+}
+
+// Announces the format of the transmission that is about to start. Not retained:
+// a listener that connects later should not be told about a finished clip.
+void publishMicStart() {
+  walkieTransmissionId = millis();
+  walkieChunkIndex = 0;
+  walkieChunkFill = 0;
+
+  if (!mqtt.connected()) {
+    Serial.println("[walkie] MQTT offline - the audio cannot be published");
+    return;
+  }
+
+  char payload[96];
+  snprintf(
+    payload, sizeof(payload),
+    "{\"id\":%lu,\"sampleRate\":%d,\"channels\":1,\"bits\":16}",
+    (unsigned long)walkieTransmissionId,
+    AUDIO_STREAM_SAMPLE_RATE
+  );
+
+  mqtt.publish(topicMicStart.c_str(), payload, false);
+}
+
+void publishMicEnd(uint32_t durationMs) {
+  flushMicChunk();
+
+  if (!mqtt.connected()) return;
+
+  char payload[128];
+  snprintf(
+    payload, sizeof(payload),
+    "{\"id\":%lu,\"chunks\":%u,\"durationMs\":%lu}",
+    (unsigned long)walkieTransmissionId,
+    (unsigned)walkieChunkIndex,
+    (unsigned long)durationMs
+  );
+
+  mqtt.publish(topicMicEnd.c_str(), payload, false);
+}
+
+// ---- dashboard -> car speaker ------------------------------------------
+
+bool speakerStreamActive = false;   // true while dashboard audio is playing
+bool speakerStreamMuted = false;    // stream dropped because the car was talking
+uint32_t speakerStreamBytes = 0;
+uint32_t speakerStreamStartMs = 0;
+uint32_t speakerLastChunkMs = 0;    // last time a chunk arrived, for the timeout
+uint32_t speakerSampleRate = AUDIO_STREAM_SAMPLE_RATE;
+
+// Pulls a number out of a tiny JSON payload without pulling in a JSON library.
+// Returns the fallback when the key is missing or not a number.
+int32_t jsonIntValue(const String& json, const char* key, int32_t fallback) {
+  const int keyIndex = json.indexOf(String("\"") + key + "\"");
+  if (keyIndex < 0) return fallback;
+
+  const int colon = json.indexOf(':', keyIndex + strlen(key));
+  if (colon < 0) return fallback;
+
+  // String::toInt() skips whitespace and stops at the first non digit, so the
+  // closing quote and the fields after it are ignored.
+  return (int32_t)json.substring(colon + 1).toInt();
+}
+
+void startSpeakerStream(uint32_t sampleRate) {
+  if (!notificationAudioReady) {
+    Serial.println("[speaker] audio output not ready - ignoring the stream");
+    return;
+  }
+
+  // A new transmission replaces whatever was still playing.
+  speakerStreamActive = false;
+  speakerStreamMuted = false;
+  notificationAudioPlaying = false;
+
+  speakerStreamBytes = 0;
+  speakerStreamStartMs = millis();
+  speakerLastChunkMs = speakerStreamStartMs;
+
+  // Half duplex, like a real walkie talkie: while the car is transmitting from
+  // its own microphone, incoming audio is dropped instead of being played back
+  // into the mic.
+  if (walkieRecording) {
+    speakerStreamMuted = true;
+    Serial.println("[speaker] car is talking - incoming audio dropped");
+    return;
+  }
+
+  speakerSampleRate =
+    (sampleRate >= 8000 && sampleRate <= 48000)
+    ? sampleRate
+    : AUDIO_STREAM_SAMPLE_RATE;
+
+  i2s_set_sample_rates(I2S_NUM_0, speakerSampleRate);
+  i2s_zero_dma_buffer(I2S_NUM_0);
+
+  // Notification clips stay quiet until the transmission ends.
+  notificationAudioPlaying = true;
+  speakerStreamActive = true;
+
+  Serial.printf(
+    "[speaker] streaming %lu Hz audio from the dashboard\n",
+    (unsigned long)speakerSampleRate
+  );
+}
+
+void stopSpeakerStream() {
+  if (!speakerStreamActive && !speakerStreamMuted) return;
+
+  const uint32_t durationMs = millis() - speakerStreamStartMs;
+
+  speakerStreamActive = false;
+  speakerStreamMuted = false;
+  notificationAudioPlaying = false;
+
+  Serial.printf(
+    "[speaker] stream ended: %.2f s, %lu bytes\n",
+    (double)durationMs / 1000.0,
+    (unsigned long)speakerStreamBytes
+  );
+
+  speakerStreamBytes = 0;
+}
+
+
+// Safety net for a dashboard that vanishes mid-transmission (locked phone,
+// dropped socket, closed tab): the "end" message never arrives, so the speaker
+// would stay reserved and notification clips would never play again.
+void serviceSpeakerStream() {
+  if (!speakerStreamActive && !speakerStreamMuted) return;
+  if (millis() - speakerLastChunkMs < SPEAKER_STREAM_TIMEOUT_MS) return;
+
+  Serial.println("[speaker] stream timed out - releasing the output");
+  stopSpeakerStream();
+}
+
+// The MAX98357A sits on a stereo I2S bus, so every mono sample is written to
+// both channels. Handing the mono bytes straight to I2S would play a clip an
+// octave low and at half speed. Returns false when the DMA stops accepting data.
+bool writeSpeakerSamples(const uint8_t* data, size_t length) {
+  static uint8_t stereo[AUDIO_CHUNK_BYTES * 2];
+
+  const size_t samples = length / 2;
+
+  for (size_t i = 0; i < samples; i++) {
+    const uint8_t low = data[i * 2];
+    const uint8_t high = data[i * 2 + 1];
+
+    stereo[i * 4 + 0] = low;
+    stereo[i * 4 + 1] = high;
+    stereo[i * 4 + 2] = low;
+    stereo[i * 4 + 3] = high;
+  }
+
+  const size_t total = samples * 4;
+  const uint32_t start = millis();
+  size_t written = 0;
+
+  // i2s_write() queues the block for the DMA and only blocks while the buffer is
+  // full, which is exactly the real time pacing the speaker needs. The budget
+  // stops a stalled bus from freezing the main loop for ever.
+  while (written < total) {
+    if (millis() - start > AUDIO_WRITE_TIMEOUT_MS) return false;
+
+    size_t accepted = 0;
+    const esp_err_t result = i2s_write(
+      I2S_NUM_0,
+      stereo + written,
+      total - written,
+      &accepted,
+      pdMS_TO_TICKS(50)
+    );
+
+    if (result != ESP_OK && result != ESP_ERR_TIMEOUT) return false;
+
+    written += accepted;
+  }
+
+  return true;
+}
+
+void writeSpeakerChunk(const uint8_t* payload, unsigned int length) {
+  if (!speakerStreamActive || length < 2) return;
+
+  speakerLastChunkMs = millis();
+
+  unsigned int offset = 0;
+
+  // The dashboard sends ~1 kB packets; anything larger is written in slices so
+  // the stereo conversion buffer never has to grow.
+  while (offset + 1 < length) {
+    unsigned int block = length - offset;
+    if (block > AUDIO_CHUNK_BYTES) block = AUDIO_CHUNK_BYTES;
+    if (block & 1) block--;   // whole samples only
+
+    if (!writeSpeakerSamples(payload + offset, block)) {
+      Serial.println("[speaker] write stalled - stopping the stream");
+      stopSpeakerStream();
+      return;
+    }
+
+    offset += block;
+  }
+
+  speakerStreamBytes += offset;
+}
+
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  const String topicName(topic);
+
+  // Audio is binary, so it is dispatched before the text branch below: building
+  // a String and trimming it would destroy the PCM samples.
+  if (topicName == topicSpeakerChunk) {
+    writeSpeakerChunk(payload, length);
+    return;
+  }
+
+  if (topicName == topicSpeakerStart) {
+    String meta;
+    meta.reserve(length + 1);
+
+    for (unsigned int i = 0; i < length; i++) {
+      meta += (char)payload[i];
+    }
+
+    startSpeakerStream(
+      (uint32_t)jsonIntValue(meta, "sampleRate", AUDIO_STREAM_SAMPLE_RATE)
+    );
+    return;
+  }
+
+  if (topicName == topicSpeakerEnd) {
+    stopSpeakerStream();
+    return;
+  }
+
   // Text must keep its original casing and spacing, so only trim the edges.
   String message;
   message.reserve(length);
@@ -1038,8 +1413,6 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     message += (char)payload[i];
   }
   message.trim();
-
-  const String topicName(topic);
 
   if (topicName == topicTextSet) {
     applyFloatingText(message);
@@ -1360,7 +1733,11 @@ void renderFrame() {
 void initMqtt() {
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(onMqttMessage);
-  mqtt.setBufferSize(512);   // room for full-length floating-text payloads
+
+  // Room for full-length floating-text payloads plus the walkie audio packets
+  // (AUDIO_CHUNK_BYTES + 2). The audio frames are the largest thing either end
+  // sends, so this sizing is what keeps them from being dropped.
+  mqtt.setBufferSize(AUDIO_CHUNK_BYTES + 64);
 
   // connect() blocks. With the default 15 s socket timeout an unreachable
   // broker freezes the loop, which also starves the gyro sampling (the idle
@@ -1370,6 +1747,8 @@ void initMqtt() {
 }
 
 void remoteLoop() {
+  serviceSpeakerStream();
+
   if (WiFi.status() != WL_CONNECTED) {
     static uint32_t lastWifiRetry = 0;
     if (millis() - lastWifiRetry > WIFI_RETRY_MS) {
@@ -1397,6 +1776,13 @@ void remoteLoop() {
     mqtt.subscribe(topicLedASet.c_str());
     mqtt.subscribe(topicLedBSet.c_str());
     mqtt.subscribe(topicTextSet.c_str());
+
+    // Walkie audio can only be pushed to the speaker while we hold this
+    // connection open, and the dashboard only talks while the user holds the
+    // button, so the subscription is always on.
+    mqtt.subscribe(topicSpeakerStart.c_str());
+    mqtt.subscribe(topicSpeakerChunk.c_str());
+    mqtt.subscribe(topicSpeakerEnd.c_str());
 
     publishLedStates();
     publishFloatingTextState();
