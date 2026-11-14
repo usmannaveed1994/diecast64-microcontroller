@@ -50,10 +50,52 @@ MPU6050 mpu(Wire);
 #define NOTIFICATION_AUDIO_FILE "/notification-click.wav"
 #define LIGHTS_AUDIO_FILE "/lights.wav"
 
+// Hold-to-talk walkie channel: this clip is played the moment the touch sensor
+// is pressed, then the microphone records until the sensor is released.
+#define WALKIE_SEND_AUDIO_FILE "/walkie-send.wav"
+
 TaskHandle_t notificationAudioTaskHandle = nullptr;
 
 bool notificationAudioReady = false;
 volatile bool notificationAudioPlaying = false;
+
+// =====================================================
+//  MICROPHONE - I2S (INMP441 style)
+// =====================================================
+
+// The microphone gets its own I2S peripheral (I2S_NUM_1) so it never fights
+// with the MAX98357A speaker, which keeps I2S_NUM_0 for itself. The driver is
+// installed once, but its bit clock is only started while a transmission is
+// actually being recorded: a permanently running ~1 MHz BCLK next to the IMU
+// wiring corrupts the MPU6050 readings enough to latch the "moving" state,
+// which silently kills the car's auto-spin.
+#define MIC_BCLK 13
+#define MIC_WS   14
+#define MIC_SD   34
+
+#define MIC_SAMPLE_RATE 16000        // 16 kHz mono is plenty for voice
+#define MIC_READ_SAMPLES 256         // 16 ms of audio per read at 16 kHz
+#define MIC_DMA_BUF_COUNT 8
+#define MIC_DMA_BUF_LEN 128          // 8 * 128 = 64 ms of buffering
+
+// INMP441: L/R tied to GND means the samples arrive on the left channel. If the
+// level stays at 0 while talking, switch this to I2S_CHANNEL_FMT_ONLY_RIGHT.
+#define MIC_CHANNEL_FORMAT I2S_CHANNEL_FMT_ONLY_LEFT
+
+// Serial output while recording. A line every 100 ms is fast enough to see the
+// level move, but slow enough to keep the monitor readable at 115200 baud.
+#define MIC_PRINT_INTERVAL_MS 100
+#define MIC_LEVEL_BAR_WIDTH 24
+#define MIC_PRINT_RAW_SAMPLES 4      // raw sample values shown on every line
+
+bool microphoneReady = false;
+
+// Hold-to-talk state machine, driven by serviceWalkie() from loop().
+bool walkieRecording = false;      // true while the microphone is being read
+bool touchWasHeld = false;         // previous touch state, for edge detection
+uint32_t walkieStartTime = 0;      // millis() when the recording started
+uint32_t walkieSampleCount = 0;    // samples captured during this press
+uint32_t lastMicPrint = 0;         // last time the level line was printed
 
 // =====================================================
 // 3D ENGINE
@@ -176,6 +218,12 @@ void debugPrintConfig() {
     "yaw: deadband %.2f deg/s, return %.2f s\n",
     (double)YAW_GYRO_DEADBAND,
     (double)YAW_RETURN_TIME
+  );
+  Serial.printf(
+    "mic: %d Hz, %d samples per read, send tone %s\n",
+    MIC_SAMPLE_RATE,
+    MIC_READ_SAMPLES,
+    WALKIE_SEND_AUDIO_FILE
   );
   Serial.println("----------------------------");
 #endif
@@ -613,19 +661,40 @@ void initNotificationAudio() {
   Serial.println("Notification audio ready!");
 }
 
-void playNotificationAudio() {
-  if (!notificationAudioReady || notificationAudioPlaying) return;
+// Streams a 16-bit PCM WAV straight to the MAX98357A. The sample rate is read
+// from the file header, so a clip exported at 16 kHz still plays at the right
+// pitch instead of being stretched over the 44.1 kHz clock.
+bool playWavFile(const char* path) {
+  if (!notificationAudioReady) return false;
 
-  notificationAudioPlaying = true;
-
-  File file = LittleFS.open(NOTIFICATION_AUDIO_FILE, "r");
+  File file = LittleFS.open(path, "r");
   if (!file) {
-    notificationAudioPlaying = false;
-    return;
+    Serial.printf("[audio] missing %s\n", path);
+    return false;
   }
 
-  // Skip standard WAV header (44 bytes)
-  file.seek(44);
+  // The 44 byte canonical WAV header also carries the sample rate.
+  uint8_t header[44];
+
+  if (file.read(header, sizeof(header)) != sizeof(header)) {
+    Serial.printf("[audio] %s is not a complete WAV file\n", path);
+    file.close();
+    return false;
+  }
+
+  const uint32_t sampleRate =
+    (uint32_t)header[24] |
+    ((uint32_t)header[25] << 8) |
+    ((uint32_t)header[26] << 16) |
+    ((uint32_t)header[27] << 24);
+
+  if (sampleRate >= 8000 && sampleRate <= 96000) {
+    i2s_set_sample_rates(I2S_NUM_0, sampleRate);
+  } else {
+    Serial.printf("[audio] %s reports %lu Hz, using %d Hz\n",
+      path, (unsigned long)sampleRate, NOTIFICATION_AUDIO_SAMPLE_RATE);
+    i2s_set_sample_rates(I2S_NUM_0, NOTIFICATION_AUDIO_SAMPLE_RATE);
+  }
 
   uint8_t buffer[512];
   size_t bytesWritten;
@@ -643,40 +712,269 @@ void playNotificationAudio() {
   }
 
   file.close();
+  return true;
+}
+
+void playNotificationAudio() {
+  // Stay quiet while the walkie channel records, otherwise the speaker ends up
+  // in the microphone signal and the loop stalls mid-recording.
+  if (!notificationAudioReady || notificationAudioPlaying || walkieRecording) return;
+
+  notificationAudioPlaying = true;
+  playWavFile(NOTIFICATION_AUDIO_FILE);
   notificationAudioPlaying = false;
 }
 
 void playLightsAudio() {
+  if (!notificationAudioReady || notificationAudioPlaying || walkieRecording) return;
+
+  notificationAudioPlaying = true;
+  playWavFile(LIGHTS_AUDIO_FILE);
+  notificationAudioPlaying = false;
+}
+
+// "I am about to talk" tone. Blocks for the length of the clip, exactly like
+// the other notification sounds.
+void playWalkieSendAudio() {
   if (!notificationAudioReady || notificationAudioPlaying) return;
 
   notificationAudioPlaying = true;
+  playWavFile(WALKIE_SEND_AUDIO_FILE);
+  notificationAudioPlaying = false;
+}
 
-  File file = LittleFS.open(LIGHTS_AUDIO_FILE, "r");
-  if (!file) {
-    notificationAudioPlaying = false;
+// =====================================================
+// MICROPHONE / WALKIE TALKIE
+// =====================================================
+
+void initMicrophone() {
+  if (!LittleFS.exists(WALKIE_SEND_AUDIO_FILE)) {
+    Serial.printf("[mic] %s not found - the send tone will be silent\n",
+      WALKIE_SEND_AUDIO_FILE);
+  }
+
+  i2s_config_t micConfig = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = MIC_SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = MIC_CHANNEL_FORMAT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = MIC_DMA_BUF_COUNT,
+    .dma_buf_len = MIC_DMA_BUF_LEN,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t micPins = {
+    .bck_io_num = MIC_BCLK,
+    .ws_io_num = MIC_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = MIC_SD
+  };
+
+  esp_err_t result = i2s_driver_install(I2S_NUM_1, &micConfig, 0, NULL);
+
+  if (result != ESP_OK) {
+    Serial.printf("[mic] I2S install failed: %d\n", result);
     return;
   }
 
-  // Skip standard WAV header (44 bytes)
-  file.seek(44);
+  i2s_set_pin(I2S_NUM_1, &micPins);
+  i2s_zero_dma_buffer(I2S_NUM_1);
 
-  uint8_t buffer[512];
-  size_t bytesWritten;
+  // Leave the microphone clocked DOWN. Only startWalkieRecording() starts it,
+  // so the mic is electrically silent while the car is just animating.
+  i2s_stop(I2S_NUM_1);
 
-  while (file.available()) {
-    int bytesRead = file.read(buffer, sizeof(buffer));
+  microphoneReady = true;
+  Serial.println("[mic] ready - hold the touch sensor to talk");
+}
 
-    i2s_write(
-      I2S_NUM_0,
-      buffer,
-      bytesRead,
-      &bytesWritten,
-      portMAX_DELAY
-    );
+// One readable line per MIC_PRINT_INTERVAL_MS: level in dBFS plus a small bar
+// and a few raw sample values, so the numbers can be followed live.
+void printMicLevel(
+  const int16_t* samples,
+  size_t count,
+  int32_t peak,
+  float rms,
+  float dc,
+  uint32_t elapsedMs
+) {
+#if DEBUG_SERIAL
+  const uint32_t now = millis();
+  if (now - lastMicPrint < MIC_PRINT_INTERVAL_MS) return;
+  lastMicPrint = now;
+
+  const float dbfs = (rms > 0.0f)
+    ? 20.0f * log10f(rms / 32768.0f)
+    : -96.0f;
+
+  float level = (dbfs + 60.0f) / 60.0f;   // -60 dBFS .. 0 dBFS -> 0 .. 1
+  if (level < 0.0f) level = 0.0f;
+  if (level > 1.0f) level = 1.0f;
+
+  const int filled = (int)(level * MIC_LEVEL_BAR_WIDTH + 0.5f);
+
+  char bar[MIC_LEVEL_BAR_WIDTH + 1];
+
+  for (int i = 0; i < MIC_LEVEL_BAR_WIDTH; i++) {
+    bar[i] = (i < filled) ? '#' : '-';
+  }
+  bar[MIC_LEVEL_BAR_WIDTH] = '\0';
+
+  Serial.printf(
+    "[mic] %5.2fs n=%lu peak=%5ld rms=%6.1f dc=%6.1f %6.1f dBFS [%s] raw=(",
+    (double)elapsedMs / 1000.0,
+    (unsigned long)walkieSampleCount,
+    (long)peak,
+    (double)rms,
+    (double)dc,
+    (double)dbfs,
+    bar
+  );
+
+  const size_t rawCount =
+    (count < MIC_PRINT_RAW_SAMPLES) ? count : MIC_PRINT_RAW_SAMPLES;
+
+  for (size_t i = 0; i < rawCount; i++) {
+    Serial.print((int)samples[i]);
+    if (i + 1 < rawCount) Serial.print(',');
   }
 
-  file.close();
-  notificationAudioPlaying = false;
+  Serial.println(")");
+#endif
+}
+
+// Pulls whatever the DMA buffer holds without blocking, then reports the level.
+void readMicrophone() {
+  if (!microphoneReady) return;
+
+  int16_t samples[MIC_READ_SAMPLES];
+  size_t bytesRead = 0;
+
+  const esp_err_t result = i2s_read(
+    I2S_NUM_1,
+    samples,
+    sizeof(samples),
+    &bytesRead,
+    0                       // 0 ticks = return immediately with what is ready
+  );
+
+  // A zero-tick read normally comes back as a *partial* buffer with
+  // ESP_ERR_TIMEOUT (the driver hands over one DMA buffer at a time), so keep
+  // whatever arrived. Dropping non-OK results threw away most of the audio and
+  // made the sample count / level line update only on full-buffer reads.
+  (void)result;
+
+  if (bytesRead == 0) return;
+
+  const size_t count = bytesRead / sizeof(int16_t);
+
+  int32_t peak = 0;
+  int64_t sum = 0;
+  int64_t sumSquares = 0;
+
+  for (size_t i = 0; i < count; i++) {
+    const int32_t sample = samples[i];
+    const int32_t magnitude = (sample < 0) ? -sample : sample;
+
+    if (magnitude > peak) peak = magnitude;
+
+    sum += sample;
+    sumSquares += (int64_t)sample * sample;
+  }
+
+  walkieSampleCount += count;
+
+  const float rms = sqrtf((float)sumSquares / (float)count);
+  const float dc = (float)sum / (float)count;
+
+  printMicLevel(samples, count, peak, rms, dc, millis() - walkieStartTime);
+}
+
+void startWalkieRecording() {
+  if (!microphoneReady) {
+    Serial.println("[walkie] microphone not ready - nothing recorded");
+    return;
+  }
+
+  // The I2S clock only runs while a transmission is in progress, so start it
+  // first and then flush the DMA buffer: the microphone also hears the send
+  // tone and none of that should end up in the transmission.
+  i2s_start(I2S_NUM_1);
+  i2s_zero_dma_buffer(I2S_NUM_1);
+
+  walkieStartTime = millis();
+  walkieSampleCount = 0;
+  lastMicPrint = walkieStartTime;
+  walkieRecording = true;
+
+  Serial.printf("[walkie] recording @ %d Hz - release to stop\n", MIC_SAMPLE_RATE);
+}
+
+void stopWalkieRecording() {
+  if (!walkieRecording) return;
+
+  walkieRecording = false;
+
+  // Clock the microphone back down: while it is running its bit clock sits next
+  // to the MPU6050 I2C lines and the gyro readings get noisy, which latches
+  // sensorMoving and freezes the car's auto-spin.
+  i2s_stop(I2S_NUM_1);
+
+  // Pushing the toy to reach the sensor, and the blocking send tone itself, both
+  // read as movement. Clear the latch so the car picks its auto-spin back up
+  // straight away instead of waiting for IDLE_DELAY_MS of detected stillness.
+  sensorMoving = false;
+  lastMotionTime = millis();
+
+  const uint32_t durationMs = millis() - walkieStartTime;
+
+  Serial.printf(
+    "[walkie] recording stopped: %.2f s, %lu samples @ %d Hz\n",
+    (double)durationMs / 1000.0,
+    (unsigned long)walkieSampleCount,
+    MIC_SAMPLE_RATE
+  );
+}
+
+// Hold-to-talk. Called on every loop pass (not once per rendered frame) so the
+// DMA buffers keep draining while the screen is being drawn.
+void serviceWalkie() {
+  const bool touchHeld = (digitalRead(TOUCH_PIN) == HIGH);
+
+  if (walkieRecording) {
+    if (touchHeld) {
+      readMicrophone();
+    } else {
+      stopWalkieRecording();
+      touchWasHeld = false;
+    }
+    return;
+  }
+
+  // Rising edge: announce the transmission, then record while it is held.
+  if (touchHeld && !touchWasHeld) {
+    touchWasHeld = true;
+
+    playWalkieSendAudio();
+
+    // The playback above blocks, so the finger may already be gone by now.
+    if (digitalRead(TOUCH_PIN) != HIGH) {
+      Serial.println("[walkie] released during send tone - nothing recorded");
+      touchWasHeld = false;
+      return;
+    }
+
+    startWalkieRecording();
+    return;
+  }
+
+  if (!touchHeld) {
+    touchWasHeld = false;
+  }
 }
 
 // =====================================================
@@ -1125,9 +1423,14 @@ void setup() {
   initDisplay();
   bootAnimation();
   initNotificationAudio();
-
   initTopics();
+
+  // The IMU has to be initialised and calibrated while the microphone is still
+  // silent. initMicrophone() installs the I2S RX driver, and if that runs first
+  // its bit clock is already ticking during calcOffsets(), which can skew the
+  // gyro offsets enough that the car never leaves the "moving" state again.
   initSensors();
+  initMicrophone();
 
   if (!connectToStoredWifi()) {
     startProvisioningAP();
@@ -1157,6 +1460,10 @@ void loop() {
 
   remoteLoop();
   updateSensors();
+
+  // Serviced every pass, before the frame gate: hold-to-talk must keep reading
+  // the microphone even while no new frame is due.
+  serviceWalkie();
 
   const uint32_t now = millis();
 
