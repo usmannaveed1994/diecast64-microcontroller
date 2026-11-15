@@ -801,7 +801,7 @@ void initMicrophone() {
   i2s_config_t micConfig = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = MIC_SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
     .channel_format = MIC_CHANNEL_FORMAT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = 0,
@@ -1305,35 +1305,52 @@ void serviceSpeakerStream() {
   stopSpeakerStream();
 }
 
-// The MAX98357A sits on a stereo I2S bus, so every mono sample is written to
-// both channels. Handing the mono bytes straight to I2S would play a clip an
-// octave low and at half speed. Returns false when the DMA stops accepting data.
 bool writeSpeakerSamples(const uint8_t* data, size_t length) {
-  static uint8_t stereo[AUDIO_CHUNK_BYTES * 2];
+  // 16-bit mono input becomes 32-bit stereo output.
+  static uint8_t stereo[AUDIO_CHUNK_BYTES * 4];
 
   const size_t samples = length / 2;
 
   for (size_t i = 0; i < samples; i++) {
-    const uint8_t low = data[i * 2];
-    const uint8_t high = data[i * 2 + 1];
+    const uint16_t raw =
+      (uint16_t)data[i * 2] |
+      ((uint16_t)data[i * 2 + 1] << 8);
 
-    stereo[i * 4 + 0] = low;
-    stereo[i * 4 + 1] = high;
-    stereo[i * 4 + 2] = low;
-    stereo[i * 4 + 3] = high;
+    const int16_t sample = (int16_t)raw;
+
+    // Align 16-bit PCM to the upper 16 bits of a 32-bit I2S slot.
+    const uint32_t sample32 =
+      (uint32_t)((int32_t)sample * 65536L);
+
+    const uint8_t b0 = (uint8_t)(sample32);
+    const uint8_t b1 = (uint8_t)(sample32 >> 8);
+    const uint8_t b2 = (uint8_t)(sample32 >> 16);
+    const uint8_t b3 = (uint8_t)(sample32 >> 24);
+
+    // Left channel
+    stereo[i * 8 + 0] = b0;
+    stereo[i * 8 + 1] = b1;
+    stereo[i * 8 + 2] = b2;
+    stereo[i * 8 + 3] = b3;
+
+    // Right channel
+    stereo[i * 8 + 4] = b0;
+    stereo[i * 8 + 5] = b1;
+    stereo[i * 8 + 6] = b2;
+    stereo[i * 8 + 7] = b3;
   }
 
-  const size_t total = samples * 4;
+  const size_t total = samples * 8;
   const uint32_t start = millis();
   size_t written = 0;
 
-  // i2s_write() queues the block for the DMA and only blocks while the buffer is
-  // full, which is exactly the real time pacing the speaker needs. The budget
-  // stops a stalled bus from freezing the main loop for ever.
   while (written < total) {
-    if (millis() - start > AUDIO_WRITE_TIMEOUT_MS) return false;
+    if (millis() - start > AUDIO_WRITE_TIMEOUT_MS) {
+      return false;
+    }
 
     size_t accepted = 0;
+
     const esp_err_t result = i2s_write(
       I2S_NUM_0,
       stereo + written,
@@ -1342,7 +1359,9 @@ bool writeSpeakerSamples(const uint8_t* data, size_t length) {
       pdMS_TO_TICKS(50)
     );
 
-    if (result != ESP_OK && result != ESP_ERR_TIMEOUT) return false;
+    if (result != ESP_OK && result != ESP_ERR_TIMEOUT) {
+      return false;
+    }
 
     written += accepted;
   }

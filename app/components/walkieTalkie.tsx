@@ -62,8 +62,7 @@ const OFFLINE_GRACE_MS = 2000;
 
 // Live playback: each packet is scheduled right after the previous one, with a
 // small lead so the Web Audio clock has time to line it up.
-const PLAYBACK_LEAD_S = 0.15;
-const PLAYBACK_MAX_LAG_S = 1.5;
+const PLAYBACK_LEAD_S = 0.50;
 
 // The device falls silent without sending "end" when the socket drops mid-clip.
 const RX_STALL_MS = 1200;
@@ -122,6 +121,7 @@ const STATUS_BADGE: Record<ConnectionStatus, { label: string; className: string 
   },
 };
 export default function WalkieTalkie() {
+  const expectedMicSequenceRef = useRef<number | null>(null);
   const clientRef = useRef<MqttClient | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -471,35 +471,36 @@ export default function WalkieTalkie() {
       });
     };
 
-    const scheduleLivePlayback = (samples: Int16Array) => {
-      const context = audioContextRef.current;
+    
+const scheduleLivePlayback = (samples: Int16Array) => {
+  const context = audioContextRef.current;
 
-      // Nothing to do until the browser has let audio start (see the unlock
-      // effect below): the clip still lands in the list for later.
-      if (!context || context.state !== 'running') return;
+  if (!context || context.state !== 'running') return;
 
-      const buffer = context.createBuffer(1, samples.length, WALKIE_SAMPLE_RATE);
-      buffer.getChannelData(0).set(int16ToFloat32(samples));
+  const buffer = context.createBuffer(1, samples.length, WALKIE_SAMPLE_RATE);
+  buffer.getChannelData(0).set(int16ToFloat32(samples));
 
-      const source = context.createBufferSource();
-      source.buffer = buffer;
-      source.connect(context.destination);
+  const source = context.createBufferSource();
+  source.buffer = buffer;
+  source.connect(context.destination);
 
-      // Packets are chained back to back so a transmission plays seamlessly. If
-      // the queue drifted (throttled tab, broker hiccup) it is re-anchored with a
-      // short lead instead of stacking latency on top of latency.
-      const now = context.currentTime;
-      let startAt = playheadRef.current;
+  const now = context.currentTime;
 
-      if (startAt < now + PLAYBACK_LEAD_S || startAt > now + PLAYBACK_MAX_LAG_S) {
-        startAt = now + PLAYBACK_LEAD_S;
-      }
+  // Buffer the first packet to give MQTT time to deliver subsequent packets.
+  // After playback starts, keep packets chained together.
+  const startAt =
+    playheadRef.current <= 0
+      ? now + PLAYBACK_LEAD_S
+      : Math.max(playheadRef.current, now + 0.005);
 
-      source.start(startAt);
-      playheadRef.current = startAt + buffer.duration;
-    };
+  source.start(startAt);
+
+  playheadRef.current = startAt + buffer.duration;
+};
+
 
     const handleStart = (payload: Uint8Array) => {
+      expectedMicSequenceRef.current = 0;
       // A previous transmission that never ended (device reset, dropped socket)
       // would otherwise leak its packets into this clip.
       finishReception();
@@ -519,42 +520,71 @@ export default function WalkieTalkie() {
       setRxLevel(0);
     };
 
-    const handleChunk = (payload: Uint8Array) => {
-      const samples = decodePcmFrame(payload);
-      if (samples.length === 0) return;
+  const handleChunk = (payload: Uint8Array) => {
+  const { sequence, samples } = decodePcmFrame(payload);
 
-      const reception =
-        receptionRef.current ??
-        ({
-          id: `car-${Date.now()}`,
-          chunks: [],
-          samples: 0,
-          receivedAt: Date.now(),
-          announcedDurationMs: 0,
-        } satisfies Reception);
+  if (sequence < 0 || samples.length === 0) return;
 
-      receptionRef.current = reception;
-      reception.chunks.push(samples);
-      reception.samples += samples.length;
+  const reception =
+    receptionRef.current ??
+    ({
+      id: `car-${Date.now()}`,
+      chunks: [],
+      samples: 0,
+      receivedAt: Date.now(),
+      announcedDurationMs: 0,
+    } satisfies Reception);
 
-      scheduleLivePlayback(samples);
+  receptionRef.current = reception;
+  reception.chunks.push(samples);
+  reception.samples += samples.length;
 
-      setRxActive(true);
+  // Detect missing packets.
+  let playbackSamples = samples;
 
-      const now = performance.now();
-      if (now - rxLevelAtRef.current > RX_LEVEL_INTERVAL_MS) {
-        rxLevelAtRef.current = now;
-        setRxLevel(audioLevel(samples));
-      }
+  if (expectedMicSequenceRef.current === null) {
+    expectedMicSequenceRef.current = (sequence + 1) & 0xffff;
+  } else {
+    const expected = expectedMicSequenceRef.current;
+    const missing = (sequence - expected + 65536) % 65536;
 
-      // The device stops without an "end" message when the socket dies mid-clip,
-      // so a silent gap also closes the reception.
-      if (stallTimer !== null) clearTimeout(stallTimer);
-      stallTimer = setTimeout(() => {
-        stallTimer = null;
-        if (!disposed) finishReception();
-      }, RX_STALL_MS);
-    };
+    if (missing > 0 && missing < 200) {
+      // Each missing full packet represents 512 samples / 32 ms.
+      const silence = new Int16Array(missing * 512);
+
+      playbackSamples = new Int16Array(
+        silence.length + samples.length
+      );
+
+      playbackSamples.set(silence);
+      playbackSamples.set(samples, silence.length);
+    } else if (missing >= 32768) {
+      // Old or duplicate packet.
+      return;
+    }
+
+    expectedMicSequenceRef.current = (sequence + 1) & 0xffff;
+  }
+
+  // Only live playback gets the silence inserted for missing packets.
+  scheduleLivePlayback(playbackSamples);
+
+  setRxActive(true);
+
+  const now = performance.now();
+
+  if (now - rxLevelAtRef.current > RX_LEVEL_INTERVAL_MS) {
+    rxLevelAtRef.current = now;
+    setRxLevel(audioLevel(samples));
+  }
+
+  if (stallTimer !== null) clearTimeout(stallTimer);
+
+  stallTimer = setTimeout(() => {
+    stallTimer = null;
+    if (!disposed) finishReception();
+  }, RX_STALL_MS);
+};
 
     const handleEnd = (payload: Uint8Array) => {
       const meta = parseAudioMeta(payload);
@@ -1033,29 +1063,37 @@ function parseAudioMeta(payload: Uint8Array): AudioMeta | null {
   }
 }
 
-/**
- * Splits a `.../audio/mic/chunk` frame into samples: 2 bytes of little endian
- * sequence number followed by little endian 16 bit PCM (see flushMicChunk() in
- * the firmware).
- */
-function decodePcmFrame(payload: Uint8Array): Int16Array {
-  const dataBytes = payload.length - AUDIO_HEADER_BYTES;
-
-  // A frame without the header, or with half a sample left, is not playable.
-  if (dataBytes < 2) return new Int16Array(0);
+function decodePcmFrame(payload: Uint8Array): {
+  sequence: number;
+  samples: Int16Array;
+} {
+  if (payload.length < 4) {
+    return { sequence: -1, samples: new Int16Array(0) };
+  }
 
   const view = new DataView(
     payload.buffer,
-    payload.byteOffset + AUDIO_HEADER_BYTES,
-    dataBytes - (dataBytes % 2)
+    payload.byteOffset,
+    payload.byteLength
   );
 
-  const samples = new Int16Array(view.byteLength / 2);
+  // First two bytes: little-endian sequence number.
+  const sequence = view.getUint16(0, true);
+
+  const dataBytes = payload.length - AUDIO_HEADER_BYTES;
+  const usableBytes = dataBytes - (dataBytes % 2);
+
+  const pcmView = new DataView(
+    payload.buffer,
+    payload.byteOffset + AUDIO_HEADER_BYTES,
+    usableBytes
+  );
+
+  const samples = new Int16Array(usableBytes / 2);
 
   for (let i = 0; i < samples.length; i++) {
-    samples[i] = view.getInt16(i * 2, true);
+    samples[i] = pcmView.getInt16(i * 2, true);
   }
 
-  return samples;
+  return { sequence, samples };
 }
-
