@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { AudioLines, Cpu, LayoutDashboard, Wifi } from 'lucide-react';
+import { Cpu, LayoutDashboard, Wifi } from 'lucide-react';
 import LedDashboard from './components/ledDashboard';
 import WalkieTalkie from './components/walkieTalkie';
 import WifiProvisioner from './components/wifiProvisioner';
@@ -61,13 +61,6 @@ export default function Home() {
             >
               <LayoutDashboard className="size-5" />
               Dashboard
-            </TabsTrigger>
-            <TabsTrigger
-              value="walkie"
-              className="h-12 flex-1 flex-col gap-1 rounded-xl px-3 text-[11px] font-medium data-active:bg-muted data-active:text-primary"
-            >
-              <AudioLines className="size-5" />
-              Walkie
             </TabsTrigger>
             <TabsTrigger
               value="provision"
