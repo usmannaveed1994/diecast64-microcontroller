@@ -51,9 +51,9 @@ const OFFLINE_GRACE_MS = 2000;
 type ChannelId = 'a' | 'b';
 type ConnectionStatus = 'connecting' | 'connected' | 'offline';
 
-const CHANNELS: { id: ChannelId; label: string; pin: string }[] = [
-  { id: 'a', label: 'LED A', pin: 'GPIO 25' },
-  { id: 'b', label: 'LED B', pin: 'GPIO 26' },
+const CHANNELS: { id: ChannelId; label: string; pin: string, bg?: string, color?: string }[] = [
+  { id: 'a', label: 'LED A', pin: 'GPIO 25', bg: 'bg-accent', color: 'text-accent-foreground' },
+  { id: 'b', label: 'LED B', pin: 'GPIO 26', bg: 'bg-primary', color: 'text-primary-foreground' },
 ];
 
 const STATUS_BADGE: Record<ConnectionStatus, { label: string; className: string }> = {
@@ -213,7 +213,7 @@ export default function LedDashboard() {
         </CardHeader>
 
         <CardContent className="space-y-2">
-          {CHANNELS.map(({ id, label, pin }) => {
+          {CHANNELS.map(({ id, label, pin, bg, color }) => {
             const isOn = leds[id];
 
             return (
@@ -229,7 +229,7 @@ export default function LedDashboard() {
                 <span
                   className={cn(
                     'flex size-10 shrink-0 items-center justify-center rounded-lg transition-colors',
-                    isOn ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'
+                    isOn ? `${bg} text-primary-foreground` : 'bg-muted text-muted-foreground'
                   )}
                 >
                   {isOn ? <Lightbulb className="size-5" /> : <LightbulbOff className="size-5" />}
@@ -243,7 +243,7 @@ export default function LedDashboard() {
                   <span
                     className={cn(
                       'block text-xs',
-                      isOn ? 'font-medium text-primary' : 'text-muted-foreground'
+                      isOn ? `font-medium ${color}` : 'text-muted-foreground'
                     )}
                   >
                     {isOn ? 'Active · ON' : 'Inactive · OFF'}
@@ -252,6 +252,7 @@ export default function LedDashboard() {
 
                 <Switch
                   id={`led-${id}`}
+                  className={isOn ? `data-[state=checked]:${bg}`: ""}
                   checked={isOn}
                   onCheckedChange={(checked) => setLed(id, checked)}
                   disabled={isDisconnected}
